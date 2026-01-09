@@ -60,9 +60,7 @@ class DistriCrossAttentionPP(DistriAttentionPP):
 
         residual = hidden_states
 
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
+        batch_size, sequence_length, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
         args = () if USE_PEFT_BACKEND else (scale,)
         query = attn.to_q(hidden_states, *args)
@@ -107,6 +105,31 @@ class DistriCrossAttentionPP(DistriAttentionPP):
 class DistriSelfAttentionPP(DistriAttentionPP):
     def __init__(self, module: Attention, distri_config: DistriConfig):
         super(DistriSelfAttentionPP, self).__init__(module, distri_config)
+        # ----------------------------------------------------------------------------------------------------
+        self.last_full_kv = None
+
+        self.spilit_list = []  # 分割高度列表
+        self.send_shapes = []  # 本设备发送的形状数组
+
+        self.other_send_shapes: list[list[int]] = []  # 其他设备发送的形状数组
+        self.slice_h: list[list[int]] = []  # 全部设备基地址发送的位置数组
+        self.other_send_times = list[int] = []  # 其他设备发送次数记录数组
+
+        self.send_times = 1  # 本设备发送计数
+        self.kv_bucket_shape = []
+        # ----------------------------------------------------------------------------------------------------
+
+    def _get_send_shapes(self, idx: int, split_list: list[int], bucket_size: int) -> list[int]:
+        send_shapes = []
+        if split_list[idx] < bucket_size:
+            send_shapes.append(split_list[idx])
+        else:
+            for i in range(1, (split_list[idx] // bucket_size) + 1):
+                send_shapes.append[bucket_size]
+            if split_list[idx] % bucket_size != 0:
+                send_shapes.append(split_list[idx] % bucket_size)
+        send_shapes = [sum(send_shapes[:i]) for i in range(len(send_shapes) + 1)]
+        return send_shapes
 
     def _forward(self, hidden_states: torch.FloatTensor, scale: float = 1.0):
         attn = self.module
@@ -129,6 +152,10 @@ class DistriSelfAttentionPP(DistriAttentionPP):
         else:
             if self.buffer_list is None:  # buffer not created
                 full_kv = torch.cat([kv for _ in range(distri_config.n_device_per_batch)], dim=1)
+                # ----------------------------------------------------------------------------------------------------
+                self.kv_bucket_shape = [full_kv.shape[0], full_kv.shape[1] // (self.distri_config.n_device_per_batch), full_kv.shape[2]]
+                # ----------------------------------------------------------------------------------------------------
+
             elif distri_config.mode == "full_sync" or self.counter <= distri_config.warmup_steps:
                 dist.all_gather(self.buffer_list, kv, group=distri_config.batch_group, async_op=False)
                 full_kv = torch.cat(self.buffer_list, dim=1)
@@ -138,6 +165,44 @@ class DistriSelfAttentionPP(DistriAttentionPP):
                 full_kv = torch.cat(new_buffer_list, dim=1)
                 if distri_config.mode != "no_sync":
                     self.comm_manager.enqueue(self.idx, kv)
+
+            # ----------------------------------------------------------------------------------------------------
+            if self.counter == distri_config.warmup_steps + 1:
+                self.spilit_list = self.distri_config.get_split_list(self.last_full_kv.shape[1])
+                self.slice_h = [sum(self.split_list[:i]) for i in range(len(self.split_list) + 1)]
+                self.send_shapes = self._get_send_shapes(distri_config.split_idx(), self.split_list, self.kv_bucket_shape[1])
+
+                for i in range(distri_config.n_device_per_batch):
+                    self.other_send_times.append(1)
+                    self.other_send_shapes.append(self._get_send_shapes(i, self.spilit_list, self.kv_bucket_shape))
+
+            kv_bucket = torch.empty(self.kv_bucket_shape, device=kv.device)
+
+            if self.send_times + 1 == len(self.send_times):  # TODO: 需要理解一下
+                kv_bucket[:, : self.send_shapes[-1] - self.send_shapes[-2], :] = kv[:, self.send_shapes[-2] : self.send_shapes[-1], :]
+                self.send_times = 1
+            else:
+                kv_bucket = kv[:, self.send_shapes[self.send_times - 1] : self.send_shapes[self.send_times], :]
+                self.send_times += 1
+
+            full_kv = self.last_full_kv
+
+            for i, buffer in enumerate(self.buffer_list):
+                if self.other_send_times[i] + 1 == len(self.other_send_shapes[i]):
+                    data = buffer[:, : self.other_send_shapes[i][-1] - self.other_send_shapes[i][-2], :]
+                    full_kv[:, self.slice_h[i] + self.other_send_shapes[i][-2] : self.slice_h[i] + self.other_send_shapes[i][-1], :] = data
+                    self.other_send_times[i] = 1
+                else:
+                    full_kv[
+                        :, self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i] - 1] : self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i]], :
+                    ] = buffer
+                    self.other_send_times[i] += 1
+
+            full_kv[:, self.slice_h[distri_config.split_idx()] : self.slice_h[distri_config.split_idx() + 1], :] = kv
+
+            if distri_config.mode != "no_sync":
+                self.comm_manager.enqueue(self.idx, kv_bucket)
+        # ----------------------------------------------------------------------------------------------------
 
         key, value = torch.split(full_kv, full_kv.shape[-1] // 2, dim=-1)
 
@@ -165,6 +230,9 @@ class DistriSelfAttentionPP(DistriAttentionPP):
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
+        # ----------------------------------------------------------------------------------------------------
+        self.last_full_kv = full_kv
+        # ----------------------------------------------------------------------------------------------------
         return hidden_states
 
     def forward(
@@ -184,9 +252,7 @@ class DistriSelfAttentionPP(DistriAttentionPP):
         b, l, c = hidden_states.shape
         if distri_config.n_device_per_batch > 1 and self.buffer_list is None:
             if self.comm_manager.buffer_list is None:
-                self.idx = self.comm_manager.register_tensor(
-                    shape=(b, l, self.to_kv.out_features), torch_dtype=hidden_states.dtype, layer_type="attn"
-                )
+                self.idx = self.comm_manager.register_tensor(shape=(b, l, self.to_kv.out_features), torch_dtype=hidden_states.dtype, layer_type="attn")
             else:
                 self.buffer_list = self.comm_manager.get_buffer_list(self.idx)
         output = self._forward(hidden_states, scale=scale)

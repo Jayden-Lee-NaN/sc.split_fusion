@@ -25,10 +25,19 @@ class DistriConv2dPP(BaseModule):
         stride = self.module.stride[0]
         padding = self.module.padding[0]
 
-        output_h = x.shape[2] // stride // config.n_device_per_batch
-        idx = config.split_idx()
-        h_begin = output_h * idx * stride - padding
-        h_end = output_h * (idx + 1) * stride + padding
+        # ----------------------------------------------------------------------------------------------------
+        if self.counter <= self.distri_config.warmup_steps:
+            output_h = x.shape[2] // stride // config.n_device_per_batch
+            idx = config.split_idx()
+            h_begin = output_h * idx * stride - padding
+            h_end = output_h * (idx + 1) * stride + padding
+        else:
+            slice_h = self.distri_config.get_split_list(h)
+            slice_h = [sum(slice_h[:i]) for i in range(len(slice_h) + 1)]
+            h_begin = slice_h[self.distri_config.split_idx()] - padding
+            h_end = slice_h[self.distri_config.split_idx() + 1] + padding
+        # ----------------------------------------------------------------------------------------------------
+
         final_padding = [padding, padding, 0, 0]
         if h_begin < 0:
             h_begin = 0

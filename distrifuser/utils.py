@@ -33,6 +33,7 @@ class DistriConfig:
         use_cuda_graph: bool = True,
         parallelism: str = "patch",
         split_scheme: str = "row",
+        split_ratio_list: list | None = None,  # 并行推理中, 分割比例清单
         verbose: bool = False,
     ):
         try:
@@ -95,6 +96,9 @@ class DistriConfig:
         self.batch_group = batch_group
         self.split_group = split_group
 
+        # 初始化每个device要计算的比例
+        self.split_ratio_list = split_ratio_list if split_ratio_list != None else [1 / self.n_device_per_batch] * self.n_device_per_batch
+
     def batch_idx(self, rank: int or None = None) -> int:
         if rank is None:
             rank = self.rank
@@ -108,7 +112,17 @@ class DistriConfig:
             rank = self.rank
         return rank % self.n_device_per_batch
 
+    def get_split_list(self, total: int) -> list[int]:
+        remain = total
+        split_list = []
+        for i in range(self.n_device_per_batch):
+            split_list.append(int(total * self.split_ratio_list[i]))
+            remain -= int(total * self.split_ratio_list[i])
+        split_list[-1] += remain  # BUG: not support odd number of total
+        return split_list
 
+
+# 通信层不需要进行修改
 class PatchParallelismCommManager:
     def __init__(self, distri_config: DistriConfig):
         self.distri_config = distri_config
@@ -127,9 +141,7 @@ class PatchParallelismCommManager:
 
         self.handles = None
 
-    def register_tensor(
-        self, shape: tuple[int, ...] or list[int], torch_dtype: torch.dtype, layer_type: str = None
-    ) -> int:
+    def register_tensor(self, shape: tuple[int, ...] or list[int], torch_dtype: torch.dtype, layer_type: str = None) -> int:
         if self.torch_dtype is None:
             self.torch_dtype = torch_dtype
         else:
@@ -151,16 +163,11 @@ class PatchParallelismCommManager:
     def create_buffer(self):
         distri_config = self.distri_config
         if distri_config.rank == 0 and distri_config.verbose:
-            print(
-                f"Create buffer with {self.numel / 1e6:.3f}M parameters for {len(self.starts)} tensors on each device."
-            )
+            print(f"Create buffer with {self.numel / 1e6:.3f}M parameters for {len(self.starts)} tensors on each device.")
             for layer_type, numel in self.numel_dict.items():
                 print(f"  {layer_type}: {numel / 1e6:.3f}M parameters")
 
-        self.buffer_list = [
-            torch.empty(self.numel, dtype=self.torch_dtype, device=self.distri_config.device)
-            for _ in range(self.distri_config.n_device_per_batch)
-        ]
+        self.buffer_list = [torch.empty(self.numel, dtype=self.torch_dtype, device=self.distri_config.device) for _ in range(self.distri_config.n_device_per_batch)]
         self.handles = [None for _ in range(len(self.starts))]
 
     def get_buffer_list(self, idx: int) -> list[torch.Tensor]:

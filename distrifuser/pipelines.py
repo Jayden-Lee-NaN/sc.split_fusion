@@ -7,6 +7,7 @@ from .models.naive_patch_sdxl import NaivePatchUNet
 from .utils import DistriConfig, PatchParallelismCommManager
 
 
+# Pipeline 基本上不需要修改
 class DistriSDXLPipeline:
     def __init__(self, pipeline: StableDiffusionXLPipeline, module_config: DistriConfig):
         self.pipeline = pipeline
@@ -19,13 +20,9 @@ class DistriSDXLPipeline:
     @staticmethod
     def from_pretrained(distri_config: DistriConfig, **kwargs):
         device = distri_config.device
-        pretrained_model_name_or_path = kwargs.pop(
-            "pretrained_model_name_or_path", "stabilityai/stable-diffusion-xl-base-1.0"
-        )
+        pretrained_model_name_or_path = kwargs.pop("pretrained_model_name_or_path", "stabilityai/stable-diffusion-xl-base-1.0")
         torch_dtype = kwargs.pop("torch_dtype", torch.float16)
-        unet = UNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path, torch_dtype=torch_dtype, subfolder="unet"
-        ).to(device)
+        unet = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, torch_dtype=torch_dtype, subfolder="unet").to(device)
 
         if distri_config.parallelism == "patch":
             unet = DistriUNetPP(unet, distri_config)
@@ -36,9 +33,7 @@ class DistriSDXLPipeline:
         else:
             raise ValueError(f"Unknown parallelism: {distri_config.parallelism}")
 
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            pretrained_model_name_or_path, torch_dtype=torch_dtype, unet=unet, **kwargs
-        ).to(device)
+        pipeline = StableDiffusionXLPipeline.from_pretrained(pretrained_model_name_or_path, torch_dtype=torch_dtype, unet=unet, **kwargs).to(device)
         return DistriSDXLPipeline(pipeline, distri_config)
 
     def set_progress_bar_config(self, **kwargs):
@@ -92,9 +87,7 @@ class DistriSDXLPipeline:
         batch_size = 2 if distri_config.do_classifier_free_guidance else 1
 
         num_channels_latents = pipeline.unet.config.in_channels
-        latents = pipeline.prepare_latents(
-            batch_size, num_channels_latents, height, width, prompt_embeds.dtype, device, None
-        )
+        latents = pipeline.prepare_latents(batch_size, num_channels_latents, height, width, prompt_embeds.dtype, device, None)
 
         # 7. Prepare added time ids & embeddings
         add_text_embeds = pooled_prompt_embeds
@@ -150,7 +143,7 @@ class DistriSDXLPipeline:
             if distri_config.parallelism == "naive_patch":
                 counters = [0, 1]
             elif distri_config.parallelism == "patch":
-                counters = [0, distri_config.warmup_steps + 1, distri_config.warmup_steps + 2]
+                counters = [0, distri_config.warmup_steps + 1, distri_config.warmup_steps + 2]  # TODO: 这里可能需要为了适应动态调整修改一下
             elif distri_config.parallelism == "tensor":
                 counters = [0]
             else:
@@ -181,9 +174,7 @@ class DistriSDPipeline:
         device = distri_config.device
         pretrained_model_name_or_path = kwargs.pop("pretrained_model_name_or_path", "CompVis/stable-diffusion-v1-4")
         torch_dtype = kwargs.pop("torch_dtype", torch.float16)
-        unet = UNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path, torch_dtype=torch_dtype, subfolder="unet"
-        ).to(device)
+        unet = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, torch_dtype=torch_dtype, subfolder="unet").to(device)
 
         if distri_config.parallelism == "patch":
             unet = DistriUNetPP(unet, distri_config)
@@ -194,9 +185,7 @@ class DistriSDPipeline:
         else:
             raise ValueError(f"Unknown parallelism: {distri_config.parallelism}")
 
-        pipeline = StableDiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path, torch_dtype=torch_dtype, unet=unet, **kwargs
-        ).to(device)
+        pipeline = StableDiffusionPipeline.from_pretrained(pretrained_model_name_or_path, torch_dtype=torch_dtype, unet=unet, **kwargs).to(device)
         return DistriSDPipeline(pipeline, distri_config)
 
     def set_progress_bar_config(self, **kwargs):
@@ -245,9 +234,7 @@ class DistriSDPipeline:
         batch_size = 2 if distri_config.do_classifier_free_guidance else 1
 
         num_channels_latents = pipeline.unet.config.in_channels
-        latents = pipeline.prepare_latents(
-            batch_size, num_channels_latents, height, width, prompt_embeds.dtype, device, None
-        )
+        latents = pipeline.prepare_latents(batch_size, num_channels_latents, height, width, prompt_embeds.dtype, device, None)
 
         prompt_embeds = prompt_embeds.to(device)
 

@@ -25,7 +25,9 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                         if kernel_size == (1, 1) or kernel_size == 1:
                             continue
                         wrapped_submodule = DistriConv2dPP(
-                            submodule, distri_config, is_first_layer=subname == "conv_in"
+                            submodule,
+                            distri_config,
+                            is_first_layer=subname == "conv_in",
                         )
                         setattr(module, subname, wrapped_submodule)
                     elif isinstance(submodule, Attention):
@@ -78,9 +80,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                 assert b == 2
                 batch_idx = distri_config.batch_idx()
                 sample = sample[batch_idx : batch_idx + 1]
-                timestep = (
-                    timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
-                )
+                timestep = timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
                 encoder_hidden_states = encoder_hidden_states[batch_idx : batch_idx + 1]
                 if added_cond_kwargs is not None:
                     for k in added_cond_kwargs:
@@ -105,6 +105,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                     assert static_inputs["added_cond_kwargs"][k].shape == added_cond_kwargs[k].shape
                     static_inputs["added_cond_kwargs"][k].copy_(added_cond_kwargs[k])
 
+            # 选择所使用的cuda图
             if self.counter <= distri_config.warmup_steps:
                 graph_idx = 0
             elif self.counter == distri_config.warmup_steps + 1:
@@ -114,7 +115,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
 
             self.cuda_graphs[graph_idx].replay()
             output = self.static_outputs[graph_idx]
-        else:
+        else:  # 不用cuda图
             if distri_config.world_size == 1:
                 output = self.model(
                     sample,
@@ -135,9 +136,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                 assert b == 2
                 batch_idx = distri_config.batch_idx()
                 sample = sample[batch_idx : batch_idx + 1]
-                timestep = (
-                    timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
-                )
+                timestep = timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
                 encoder_hidden_states = encoder_hidden_states[batch_idx : batch_idx + 1]
                 if added_cond_kwargs is not None:
                     new_added_cond_kwargs = {}
@@ -160,14 +159,25 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                     return_dict=False,
                 )[0]
                 if self.output_buffer is None:
-                    self.output_buffer = torch.empty((b, c, h, w), device=output.device, dtype=output.dtype)
+                    self.output_buffer = torch.empty(
+                        (b, c, h, w), device=output.device, dtype=output.dtype
+                    )  # TODO: 这里可以考虑修改为启用classifier free guidance的时候为2, 不启用的时候为1
                 if self.buffer_list is None:
                     self.buffer_list = [torch.empty_like(output) for _ in range(distri_config.world_size)]
                 dist.all_gather(self.buffer_list, output.contiguous(), async_op=False)
-                torch.cat(self.buffer_list[: distri_config.n_device_per_batch], dim=2, out=self.output_buffer[0:1])
-                torch.cat(self.buffer_list[distri_config.n_device_per_batch :], dim=2, out=self.output_buffer[1:2])
+                torch.cat(
+                    self.buffer_list[: distri_config.n_device_per_batch],
+                    dim=2,
+                    out=self.output_buffer[0:1],
+                )  # 拼第一张图
+                torch.cat(
+                    self.buffer_list[distri_config.n_device_per_batch :],
+                    dim=2,
+                    out=self.output_buffer[1:2],
+                )  # 拼第二张图
                 output = self.output_buffer
             else:
+                # ----------------------------------------------------------------------------------------------------#
                 output = self.model(
                     sample,
                     timestep,
@@ -185,12 +195,33 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                 )[0]
                 if self.output_buffer is None:
                     self.output_buffer = torch.empty((b, c, h, w), device=output.device, dtype=output.dtype)
-                if self.buffer_list is None:
-                    self.buffer_list = [torch.empty_like(output) for _ in range(distri_config.world_size)]
-                output = output.contiguous()
-                dist.all_gather(self.buffer_list, output, async_op=False)
-                torch.cat(self.buffer_list, dim=2, out=self.output_buffer)
-                output = self.output_buffer
+                if self.counter <= self.distri_config.warmup_steps:  # 在 warmup 阶段使用同步的方式进行数据拼接
+                    if self.buffer_list is None:
+                        self.buffer_list = [torch.empty_like(output) for _ in range(distri_config.world_size)]
+                    output = output.contiguous()
+                    dist.all_gather(self.buffer_list, output, async_op=False)
+                    torch.cat(self.buffer_list, dim=2, out=self.output_buffer)
+                    output = self.output_buffer
+                else:  # 非warmup的推理阶段
+                    output = output.contiguous()
+                    output_buffer_size = 1
+                    for dim in self.output_buffer.shape:
+                        output_buffer_size *= dim
+
+                    self.output_buffer = self.output_buffer.flatten()
+                    slice_indice = self.distri_config.get_split_list(output_buffer_size)  # 每一个device需要计算的数据量
+                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]  # 得到具体的下标索引
+                    self.output_buffer[slice_indice[self.distri_config.split_idx()] : slice_indice[self.distri_config.split_idx() + 1]] = output.flatten()
+
+                    # 拼接数据
+                    for rank in range(self.distri_config.n_device_per_batch):
+                        dist.broadcast(tensor=self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]], src=rank, group=self.distri_config.batch_group, async_op=False)
+
+                    output_buffer_ = []
+                    for rank in range(self.distri_config.n_device_per_batch):
+                        output_buffer_.append(self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]]).view(b, c, -1, w)
+                    output = torch.cat(output_buffer_, dim=2)
+                # ----------------------------------------------------------------------------------------------------#
             if record:
                 if self.static_inputs is None:
                     self.static_inputs = {
