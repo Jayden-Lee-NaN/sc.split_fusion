@@ -3,7 +3,7 @@ from distrifuser.pipelines import DistriSDXLPipeline
 from distrifuser.utils import DistriConfig
 
 # split_ratio_list = [0.125, 0.375, 0.25, 0.25]
-split_ratio_list = [0.25, 0.75]
+split_ratio_list = [0.375, 0.625]
 
 distri_config = DistriConfig(height=1024, width=1024, warmup_steps=4, split_ratio_list=split_ratio_list, do_classifier_free_guidance=True)
 pipeline = DistriSDXLPipeline.from_pretrained(

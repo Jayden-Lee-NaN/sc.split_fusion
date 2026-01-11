@@ -247,10 +247,8 @@ class DistriSelfAttentionPP(DistriAttentionPP):
         distri_config = self.distri_config
         if self.comm_manager is not None and self.comm_manager.handles is not None and self.idx is not None:
             if self.comm_manager.handles[self.idx] is not None:
-                print(f"{self.distri_config.rank}, {self.distri_config.batch_idx()}: 等待数据")
                 self.comm_manager.handles[self.idx].wait()
                 self.comm_manager.handles[self.idx] = None
-                print(f"{self.distri_config.rank}, {self.distri_config.batch_idx()}: 数据处理完毕")
 
         b, l, c = hidden_states.shape
         if distri_config.n_device_per_batch > 1 and self.buffer_list is None:
