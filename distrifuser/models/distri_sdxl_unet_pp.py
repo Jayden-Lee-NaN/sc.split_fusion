@@ -219,7 +219,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
 
                     output_buffer_ = []
                     for rank in range(self.distri_config.n_device_per_batch):
-                        output_buffer_.append(self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]]).view(b, c, -1, w)
+                        output_buffer_.append(self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]].view(b, c, -1, w))
                     output = torch.cat(output_buffer_, dim=2)
                 # ----------------------------------------------------------------------------------------------------#
             if record:

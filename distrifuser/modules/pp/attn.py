@@ -108,12 +108,12 @@ class DistriSelfAttentionPP(DistriAttentionPP):
         # ----------------------------------------------------------------------------------------------------
         self.last_full_kv = None
 
-        self.spilit_list = []  # 分割高度列表
+        self.split_list = []  # 分割高度列表
         self.send_shapes = []  # 本设备发送的形状数组
 
         self.other_send_shapes: list[list[int]] = []  # 其他设备发送的形状数组
         self.slice_h: list[list[int]] = []  # 全部设备基地址发送的位置数组
-        self.other_send_times = list[int] = []  # 其他设备发送次数记录数组
+        self.other_send_times: list[int] = []  # 其他设备发送次数记录数组
 
         self.send_times = 1  # 本设备发送计数
         self.kv_bucket_shape = []
@@ -125,7 +125,7 @@ class DistriSelfAttentionPP(DistriAttentionPP):
             send_shapes.append(split_list[idx])
         else:
             for i in range(1, (split_list[idx] // bucket_size) + 1):
-                send_shapes.append[bucket_size]
+                send_shapes.append(bucket_size)
             if split_list[idx] % bucket_size != 0:
                 send_shapes.append(split_list[idx] % bucket_size)
         send_shapes = [sum(send_shapes[:i]) for i in range(len(send_shapes) + 1)]
@@ -160,49 +160,50 @@ class DistriSelfAttentionPP(DistriAttentionPP):
                 dist.all_gather(self.buffer_list, kv, group=distri_config.batch_group, async_op=False)
                 full_kv = torch.cat(self.buffer_list, dim=1)
             else:
-                new_buffer_list = [buffer for buffer in self.buffer_list]
-                new_buffer_list[distri_config.split_idx()] = kv
-                full_kv = torch.cat(new_buffer_list, dim=1)
-                if distri_config.mode != "no_sync":
-                    self.comm_manager.enqueue(self.idx, kv)
 
-            # ----------------------------------------------------------------------------------------------------
-            if self.counter == distri_config.warmup_steps + 1:
-                self.spilit_list = self.distri_config.get_split_list(self.last_full_kv.shape[1])
-                self.slice_h = [sum(self.split_list[:i]) for i in range(len(self.split_list) + 1)]
-                self.send_shapes = self._get_send_shapes(distri_config.split_idx(), self.split_list, self.kv_bucket_shape[1])
+                # new_buffer_list = [buffer for buffer in self.buffer_list]
+                # new_buffer_list[distri_config.split_idx()] = kv
+                # full_kv = torch.cat(new_buffer_list, dim=1)
+                # if distri_config.mode != "no_sync":
+                #     self.comm_manager.enqueue(self.idx, kv)
 
-                for i in range(distri_config.n_device_per_batch):
-                    self.other_send_times.append(1)
-                    self.other_send_shapes.append(self._get_send_shapes(i, self.spilit_list, self.kv_bucket_shape))
+                # ----------------------------------------------------------------------------------------------------
+                if self.counter == distri_config.warmup_steps + 1:
+                    self.split_list = self.distri_config.get_split_list(self.last_full_kv.shape[1])
+                    self.slice_h = [sum(self.split_list[:i]) for i in range(len(self.split_list) + 1)]
+                    self.send_shapes = self._get_send_shapes(distri_config.split_idx(), self.split_list, self.kv_bucket_shape[1])
 
-            kv_bucket = torch.empty(self.kv_bucket_shape, device=kv.device)
+                    for i in range(distri_config.n_device_per_batch): 
+                        self.other_send_times.append(1) 
+                        self.other_send_shapes.append(self._get_send_shapes(i, self.split_list, self.kv_bucket_shape[1])) 
 
-            if self.send_times + 1 == len(self.send_times):  # TODO: 需要理解一下
-                kv_bucket[:, : self.send_shapes[-1] - self.send_shapes[-2], :] = kv[:, self.send_shapes[-2] : self.send_shapes[-1], :]
-                self.send_times = 1
-            else:
-                kv_bucket = kv[:, self.send_shapes[self.send_times - 1] : self.send_shapes[self.send_times], :]
-                self.send_times += 1
+                kv_bucket = torch.empty(self.kv_bucket_shape, device=kv.device)
 
-            full_kv = self.last_full_kv
-
-            for i, buffer in enumerate(self.buffer_list):
-                if self.other_send_times[i] + 1 == len(self.other_send_shapes[i]):
-                    data = buffer[:, : self.other_send_shapes[i][-1] - self.other_send_shapes[i][-2], :]
-                    full_kv[:, self.slice_h[i] + self.other_send_shapes[i][-2] : self.slice_h[i] + self.other_send_shapes[i][-1], :] = data
-                    self.other_send_times[i] = 1
+                if self.send_times + 1 == len(self.send_shapes):  # TODO: 需要理解一下
+                    kv_bucket[:, : self.send_shapes[-1] - self.send_shapes[-2], :] = kv[:, self.send_shapes[-2] : self.send_shapes[-1], :]
+                    self.send_times = 1
                 else:
-                    full_kv[
-                        :, self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i] - 1] : self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i]], :
-                    ] = buffer
-                    self.other_send_times[i] += 1
+                    kv_bucket = kv[:, self.send_shapes[self.send_times - 1] : self.send_shapes[self.send_times], :]
+                    self.send_times += 1
 
-            full_kv[:, self.slice_h[distri_config.split_idx()] : self.slice_h[distri_config.split_idx() + 1], :] = kv
+                full_kv = self.last_full_kv
 
-            if distri_config.mode != "no_sync":
-                self.comm_manager.enqueue(self.idx, kv_bucket)
-        # ----------------------------------------------------------------------------------------------------
+                for i, buffer in enumerate(self.buffer_list):
+                    if self.other_send_times[i] + 1 == len(self.other_send_shapes[i]):
+                        data = buffer[:, : self.other_send_shapes[i][-1] - self.other_send_shapes[i][-2], :]
+                        full_kv[:, self.slice_h[i] + self.other_send_shapes[i][-2] : self.slice_h[i] + self.other_send_shapes[i][-1], :] = data
+                        self.other_send_times[i] = 1
+                    else:
+                        full_kv[
+                            :, self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i] - 1] : self.slice_h[i] + self.other_send_shapes[i][self.other_send_times[i]], :
+                        ] = buffer
+                        self.other_send_times[i] += 1
+
+                full_kv[:, self.slice_h[distri_config.split_idx()] : self.slice_h[distri_config.split_idx() + 1], :] = kv
+
+                if distri_config.mode != "no_sync":
+                    self.comm_manager.enqueue(self.idx, kv_bucket)
+            # ----------------------------------------------------------------------------------------------------
 
         key, value = torch.split(full_kv, full_kv.shape[-1] // 2, dim=-1)
 
@@ -246,8 +247,10 @@ class DistriSelfAttentionPP(DistriAttentionPP):
         distri_config = self.distri_config
         if self.comm_manager is not None and self.comm_manager.handles is not None and self.idx is not None:
             if self.comm_manager.handles[self.idx] is not None:
+                print(f"{self.distri_config.rank}, {self.distri_config.batch_idx()}: 等待数据")
                 self.comm_manager.handles[self.idx].wait()
                 self.comm_manager.handles[self.idx] = None
+                print(f"{self.distri_config.rank}, {self.distri_config.batch_idx()}: 数据处理完毕")
 
         b, l, c = hidden_states.shape
         if distri_config.n_device_per_batch > 1 and self.buffer_list is None:
