@@ -158,21 +158,49 @@ class SplitUNetPP(BaseModel):
                     return_dict=False,
                 )[0]
                 if self.output_buffer is None:
-                    self.output_buffer = torch.empty((b, c, h, w), device=output.device, dtype=output.dtype)
-                if self.buffer_list is None:
-                    self.buffer_list = [torch.empty_like(output) for _ in range(split_config.world_size)]
-                dist.all_gather(self.buffer_list, output.contiguous(), async_op=False)
-                torch.cat(
-                    self.buffer_list[: split_config.n_device_per_batch],
-                    dim=2,
-                    out=self.output_buffer[0:1],
-                )
-                torch.cat(
-                    self.buffer_list[split_config.n_device_per_batch :],
-                    dim=2,
-                    out=self.output_buffer[1:2],
-                )
-                output = self.output_buffer
+                    self.output_buffer = torch.empty((2 if split_config.do_classifier_free_guidance else 1, c, h, w), device=output.device, dtype=output.dtype)
+
+                if self.counter <= self.split_config.warmup_steps:
+                    if self.buffer_list is None:
+                        self.buffer_list = [torch.empty_like(output) for _ in range(split_config.world_size)]
+                    dist.all_gather(self.buffer_list, output.contiguous(), async_op=False)
+                    torch.cat(self.buffer_list[: split_config.n_device_per_batch], dim=2, out=self.output_buffer[0:1])
+                    torch.cat(self.buffer_list[split_config.n_device_per_batch :], dim=2, out=self.output_buffer[1:2])
+                    output = self.output_buffer
+                else:
+                    output = output.contiguous()
+                    output_buffer_size = 1
+                    for dim in self.output_buffer.shape:
+                        output_buffer_size *= dim
+                    noise_img_size = output_buffer_size // 2
+
+                    self.output_buffer = self.output_buffer.flatten()
+
+                    slice_indice = self.split_config.get_split_list(noise_img_size)
+                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]
+
+                    noise_imgs = []
+                    noise_imgs.append(self.output_buffer[: int(len(self.output_buffer) / 2)])
+                    noise_imgs.append(self.output_buffer[int(-len(self.output_buffer) / 2) :])
+
+                    noise_imgs[self.split_config.batch_idx()][slice_indice[self.split_config.split_idx()] : slice_indice[self.split_config.split_idx() + 1]] = output.flatten()
+
+                    for rank in range(self.split_config.world_size):
+                        dist.broadcast(
+                            tensor=noise_imgs[int(rank / self.split_config.n_device_per_batch)][
+                                slice_indice[rank % self.split_config.n_device_per_batch] : slice_indice[rank % self.split_config.n_device_per_batch + 1]
+                            ],
+                            src=rank,
+                            async_op=False,
+                        )
+                    self.output_buffer = self.output_buffer.view(2 if split_config.do_classifier_free_guidance else 1, c, h, w)
+                    self.output_buffer[0:1] = torch.cat(
+                        [noise_imgs[0][slice_indice[rank] : slice_indice[rank + 1]].reshape(1, c, -1, w) for rank in range(len(slice_indice) - 1)], dim=2
+                    )
+                    self.output_buffer[1:2] = torch.cat(
+                        [noise_imgs[1][slice_indice[rank] : slice_indice[rank + 1]].reshape(1, c, -1, w) for rank in range(len(slice_indice) - 1)], dim=2
+                    )
+                    output = self.output_buffer
             else:
                 output = self.model(
                     sample,
