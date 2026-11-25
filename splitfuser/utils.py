@@ -20,7 +20,7 @@ def is_power_of_2(n: int) -> bool:
     return (n & (n - 1) == 0) and n != 0
 
 
-class DistriConfig:
+class SplitConfig:
     def __init__(
         self,
         height: int = 1024,
@@ -33,7 +33,7 @@ class DistriConfig:
         use_cuda_graph: bool = True,
         parallelism: str = "patch",
         split_scheme: str = "row",
-        split_ratio_list: list | None = None,  # 并行推理中, 分割比例清单
+        split_ratio_list: list | None = None,
         verbose: bool = False,
     ):
         try:
@@ -96,7 +96,6 @@ class DistriConfig:
         self.batch_group = batch_group
         self.split_group = split_group
 
-        # 初始化每个device要计算的比例
         self.split_ratio_list = split_ratio_list if split_ratio_list != None else [1 / self.n_device_per_batch] * self.n_device_per_batch
 
     def batch_idx(self, rank: int or None = None) -> int:
@@ -118,14 +117,13 @@ class DistriConfig:
         for i in range(self.n_device_per_batch):
             split_list.append(int(total * self.split_ratio_list[i]))
             remain -= int(total * self.split_ratio_list[i])
-        split_list[-1] += remain  # BUG: not support odd number of total
+        split_list[-1] += remain
         return split_list
 
 
-# 通信层不需要进行修改
 class PatchParallelismCommManager:
-    def __init__(self, distri_config: DistriConfig):
-        self.distri_config = distri_config
+    def __init__(self, split_config: SplitConfig):
+        self.split_config = split_config
 
         self.torch_dtype = None
         self.numel = 0
@@ -161,13 +159,13 @@ class PatchParallelismCommManager:
         return len(self.starts) - 1
 
     def create_buffer(self):
-        distri_config = self.distri_config
-        if distri_config.rank == 0 and distri_config.verbose:
+        split_config = self.split_config
+        if split_config.rank == 0 and split_config.verbose:
             print(f"Create buffer with {self.numel / 1e6:.3f}M parameters for {len(self.starts)} tensors on each device.")
             for layer_type, numel in self.numel_dict.items():
                 print(f"  {layer_type}: {numel / 1e6:.3f}M parameters")
 
-        self.buffer_list = [torch.empty(self.numel, dtype=self.torch_dtype, device=self.distri_config.device) for _ in range(self.distri_config.n_device_per_batch)]
+        self.buffer_list = [torch.empty(self.numel, dtype=self.torch_dtype, device=self.split_config.device) for _ in range(self.split_config.n_device_per_batch)]
         self.handles = [None for _ in range(len(self.starts))]
 
     def get_buffer_list(self, idx: int) -> list[torch.Tensor]:
@@ -175,25 +173,25 @@ class PatchParallelismCommManager:
         return buffer_list
 
     def communicate(self):
-        distri_config = self.distri_config
+        split_config = self.split_config
         start = self.starts[self.idx_queue[0]]
         end = self.ends[self.idx_queue[-1]]
-        tensor = self.buffer_list[distri_config.split_idx()][start:end]
+        tensor = self.buffer_list[split_config.split_idx()][start:end]
         buffer_list = [t[start:end] for t in self.buffer_list]
-        handle = dist.all_gather(buffer_list, tensor, group=self.distri_config.batch_group, async_op=True)
+        handle = dist.all_gather(buffer_list, tensor, group=self.split_config.batch_group, async_op=True)
         for i in self.idx_queue:
             self.handles[i] = handle
         self.idx_queue = []
 
     def enqueue(self, idx: int, tensor: torch.Tensor):
-        distri_config = self.distri_config
+        split_config = self.split_config
         if idx == 0 and len(self.idx_queue) > 0:
             self.communicate()
         assert len(self.idx_queue) == 0 or self.idx_queue[-1] == idx - 1
         self.idx_queue.append(idx)
-        self.buffer_list[distri_config.split_idx()][self.starts[idx] : self.ends[idx]].copy_(tensor.flatten())
+        self.buffer_list[split_config.split_idx()][self.starts[idx] : self.ends[idx]].copy_(tensor.flatten())
 
-        if len(self.idx_queue) == distri_config.comm_checkpoint:
+        if len(self.idx_queue) == split_config.comm_checkpoint:
             self.communicate()
 
     def clear(self):

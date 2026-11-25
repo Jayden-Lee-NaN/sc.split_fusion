@@ -5,17 +5,17 @@ from diffusers.models.unet_2d_condition import UNet2DConditionOutput
 from torch import distributed as dist, nn
 
 from .base_model import BaseModel
-from distrifuser.modules.pp.attn import DistriCrossAttentionPP, DistriSelfAttentionPP
-from distrifuser.modules.base_module import BaseModule
-from distrifuser.modules.pp.conv2d import DistriConv2dPP
-from distrifuser.modules.pp.groupnorm import DistriGroupNorm
-from ..utils import DistriConfig
+from splitfuser.modules.pp.attn import SplitCrossAttentionPP, SplitSelfAttentionPP
+from splitfuser.modules.base_module import BaseModule
+from splitfuser.modules.pp.conv2d import SplitConv2dPP
+from splitfuser.modules.pp.groupnorm import SplitGroupNorm
+from ..utils import SplitConfig
 
 
-class DistriUNetPP(BaseModel):  # for Patch Parallelism
-    def __init__(self, model: UNet2DConditionModel, distri_config: DistriConfig):
+class SplitUNetPP(BaseModel):
+    def __init__(self, model: UNet2DConditionModel, split_config: SplitConfig):
         assert isinstance(model, UNet2DConditionModel)
-        if distri_config.world_size > 1 and distri_config.n_device_per_batch > 1:
+        if split_config.world_size > 1 and split_config.n_device_per_batch > 1:
             for name, module in model.named_modules():
                 if isinstance(module, BaseModule):
                     continue
@@ -24,24 +24,24 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                         kernel_size = submodule.kernel_size
                         if kernel_size == (1, 1) or kernel_size == 1:
                             continue
-                        wrapped_submodule = DistriConv2dPP(
+                        wrapped_submodule = SplitConv2dPP(
                             submodule,
-                            distri_config,
+                            split_config,
                             is_first_layer=subname == "conv_in",
                         )
                         setattr(module, subname, wrapped_submodule)
                     elif isinstance(submodule, Attention):
-                        if subname == "attn1":  # self attention
-                            wrapped_submodule = DistriSelfAttentionPP(submodule, distri_config)
-                        else:  # cross attention
+                        if subname == "attn1":
+                            wrapped_submodule = SplitSelfAttentionPP(submodule, split_config)
+                        else:
                             assert subname == "attn2"
-                            wrapped_submodule = DistriCrossAttentionPP(submodule, distri_config)
+                            wrapped_submodule = SplitCrossAttentionPP(submodule, split_config)
                         setattr(module, subname, wrapped_submodule)
                     elif isinstance(submodule, nn.GroupNorm):
-                        wrapped_submodule = DistriGroupNorm(submodule, distri_config)
+                        wrapped_submodule = SplitGroupNorm(submodule, split_config)
                         setattr(module, subname, wrapped_submodule)
 
-        super(DistriUNetPP, self).__init__(model, distri_config)
+        super(SplitUNetPP, self).__init__(model, split_config)
 
     def forward(
         self,
@@ -60,7 +60,7 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
         return_dict: bool = True,
         record: bool = False,
     ):
-        distri_config = self.distri_config
+        split_config = self.split_config
         b, c, h, w = sample.shape
         assert (
             class_labels is None
@@ -73,12 +73,12 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
             and encoder_attention_mask is None
         )
 
-        if distri_config.use_cuda_graph and not record:
+        if split_config.use_cuda_graph and not record:
             static_inputs = self.static_inputs
 
-            if distri_config.world_size > 1 and distri_config.do_classifier_free_guidance and distri_config.split_batch:
+            if split_config.world_size > 1 and split_config.do_classifier_free_guidance and split_config.split_batch:
                 assert b == 2
-                batch_idx = distri_config.batch_idx()
+                batch_idx = split_config.batch_idx()
                 sample = sample[batch_idx : batch_idx + 1]
                 timestep = timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
                 encoder_hidden_states = encoder_hidden_states[batch_idx : batch_idx + 1]
@@ -105,18 +105,17 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                     assert static_inputs["added_cond_kwargs"][k].shape == added_cond_kwargs[k].shape
                     static_inputs["added_cond_kwargs"][k].copy_(added_cond_kwargs[k])
 
-            # 选择所使用的cuda图
-            if self.counter <= distri_config.warmup_steps:
+            if self.counter <= split_config.warmup_steps:
                 graph_idx = 0
-            elif self.counter == distri_config.warmup_steps + 1:
+            elif self.counter == split_config.warmup_steps + 1:
                 graph_idx = 1
             else:
                 graph_idx = 2
 
             self.cuda_graphs[graph_idx].replay()
             output = self.static_outputs[graph_idx]
-        else:  # 不用cuda图
-            if distri_config.world_size == 1:
+        else:
+            if split_config.world_size == 1:
                 output = self.model(
                     sample,
                     timestep,
@@ -132,9 +131,9 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
                 )[0]
-            elif distri_config.do_classifier_free_guidance and distri_config.split_batch:
+            elif split_config.do_classifier_free_guidance and split_config.split_batch:
                 assert b == 2
-                batch_idx = distri_config.batch_idx()
+                batch_idx = split_config.batch_idx()
                 sample = sample[batch_idx : batch_idx + 1]
                 timestep = timestep[batch_idx : batch_idx + 1] if torch.is_tensor(timestep) and timestep.ndim > 0 else timestep
                 encoder_hidden_states = encoder_hidden_states[batch_idx : batch_idx + 1]
@@ -159,50 +158,50 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                     return_dict=False,
                 )[0]
                 if self.output_buffer is None:
-                    self.output_buffer = torch.empty((2 if distri_config.do_classifier_free_guidance else 1, c, h, w), device=output.device, dtype=output.dtype)
+                    self.output_buffer = torch.empty((2 if split_config.do_classifier_free_guidance else 1, c, h, w), device=output.device, dtype=output.dtype)
 
-                if self.counter <= self.distri_config.warmup_steps:    # warmup stage
+                if self.counter <= self.split_config.warmup_steps:
                     if self.buffer_list is None:
-                        self.buffer_list = [torch.empty_like(output) for _ in range(distri_config.world_size)]
+                        self.buffer_list = [torch.empty_like(output) for _ in range(split_config.world_size)]
                     dist.all_gather(self.buffer_list, output.contiguous(), async_op=False)
-                    torch.cat(self.buffer_list[: distri_config.n_device_per_batch], dim=2, out=self.output_buffer[0:1])
-                    torch.cat(self.buffer_list[distri_config.n_device_per_batch :], dim=2, out=self.output_buffer[1:2])
+                    torch.cat(self.buffer_list[: split_config.n_device_per_batch], dim=2, out=self.output_buffer[0:1])
+                    torch.cat(self.buffer_list[split_config.n_device_per_batch :], dim=2, out=self.output_buffer[1:2])
                     output = self.output_buffer
-                else:                                                  # normal stage
+                else:
                     output = output.contiguous()
                     output_buffer_size = 1
                     for dim in self.output_buffer.shape:
                         output_buffer_size *= dim
-                    noise_img_size = output_buffer_size // 2        
+                    noise_img_size = output_buffer_size // 2
 
                     self.output_buffer = self.output_buffer.flatten()
-                    
-                    slice_indice = self.distri_config.get_split_list(noise_img_size) 
-                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]
-                    
-                    noise_imgs = []
-                    noise_imgs.append(self.output_buffer[:int(len(self.output_buffer) / 2)])
-                    noise_imgs.append(self.output_buffer[int(-len(self.output_buffer) / 2):])
 
-                    noise_imgs[self.distri_config.batch_idx()][slice_indice[self.distri_config.split_idx()] : slice_indice[self.distri_config.split_idx() + 1]] = output.flatten()
-                    
-                    for rank in range(self.distri_config.world_size):
-                         dist.broadcast(
-                            tensor=noise_imgs[int(rank / self.distri_config.n_device_per_batch)]
-                            [slice_indice[rank % self.distri_config.n_device_per_batch] : slice_indice[rank % self.distri_config.n_device_per_batch + 1]],
+                    slice_indice = self.split_config.get_split_list(noise_img_size)
+                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]
+
+                    noise_imgs = []
+                    noise_imgs.append(self.output_buffer[: int(len(self.output_buffer) / 2)])
+                    noise_imgs.append(self.output_buffer[int(-len(self.output_buffer) / 2) :])
+
+                    noise_imgs[self.split_config.batch_idx()][slice_indice[self.split_config.split_idx()] : slice_indice[self.split_config.split_idx() + 1]] = output.flatten()
+
+                    for rank in range(self.split_config.world_size):
+                        dist.broadcast(
+                            tensor=noise_imgs[int(rank / self.split_config.n_device_per_batch)][
+                                slice_indice[rank % self.split_config.n_device_per_batch] : slice_indice[rank % self.split_config.n_device_per_batch + 1]
+                            ],
                             src=rank,
-                            async_op=False
+                            async_op=False,
                         )
-                    self.output_buffer = self.output_buffer.view(2 if distri_config.do_classifier_free_guidance else 1, c, h, w)
+                    self.output_buffer = self.output_buffer.view(2 if split_config.do_classifier_free_guidance else 1, c, h, w)
                     self.output_buffer[0:1] = torch.cat(
-                        [noise_imgs[0][slice_indice[rank]:slice_indice[rank+1]].reshape(1,c,-1,w) for rank in range(len(slice_indice)-1)]
-                        , dim=2)
+                        [noise_imgs[0][slice_indice[rank] : slice_indice[rank + 1]].reshape(1, c, -1, w) for rank in range(len(slice_indice) - 1)], dim=2
+                    )
                     self.output_buffer[1:2] = torch.cat(
-                        [noise_imgs[1][slice_indice[rank]:slice_indice[rank+1]].reshape(1,c,-1,w) for rank in range(len(slice_indice)-1)]
-                        , dim=2)
+                        [noise_imgs[1][slice_indice[rank] : slice_indice[rank + 1]].reshape(1, c, -1, w) for rank in range(len(slice_indice) - 1)], dim=2
+                    )
                     output = self.output_buffer
             else:
-                # ----------------------------------------------------------------------------------------------------#
                 output = self.model(
                     sample,
                     timestep,
@@ -220,33 +219,31 @@ class DistriUNetPP(BaseModel):  # for Patch Parallelism
                 )[0]
                 if self.output_buffer is None:
                     self.output_buffer = torch.empty((b, c, h, w), device=output.device, dtype=output.dtype)
-                if self.counter <= self.distri_config.warmup_steps:  # 在 warmup 阶段使用同步的方式进行数据拼接
+                if self.counter <= self.split_config.warmup_steps:  # 在 warmup 阶段使用同步的方式进行数据拼接
                     if self.buffer_list is None:
-                        self.buffer_list = [torch.empty_like(output) for _ in range(distri_config.world_size)]
+                        self.buffer_list = [torch.empty_like(output) for _ in range(split_config.world_size)]
                     output = output.contiguous()
                     dist.all_gather(self.buffer_list, output, async_op=False)
                     torch.cat(self.buffer_list, dim=2, out=self.output_buffer)
                     output = self.output_buffer
-                else:  # 非warmup的推理阶段
+                else:
                     output = output.contiguous()
                     output_buffer_size = 1
                     for dim in self.output_buffer.shape:
                         output_buffer_size *= dim
 
                     self.output_buffer = self.output_buffer.flatten()
-                    slice_indice = self.distri_config.get_split_list(output_buffer_size)  # 每一个device需要计算的数据量
-                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]  # 得到具体的下标索引
-                    self.output_buffer[slice_indice[self.distri_config.split_idx()] : slice_indice[self.distri_config.split_idx() + 1]] = output.flatten()
+                    slice_indice = self.split_config.get_split_list(output_buffer_size)
+                    slice_indice = [sum(slice_indice[:i]) for i in range(len(slice_indice) + 1)]
+                    self.output_buffer[slice_indice[self.split_config.split_idx()] : slice_indice[self.split_config.split_idx() + 1]] = output.flatten()
 
-                    # 拼接数据
-                    for rank in range(self.distri_config.n_device_per_batch):
-                        dist.broadcast(tensor=self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]], src=rank, group=self.distri_config.batch_group, async_op=False)
+                    for rank in range(self.split_config.n_device_per_batch):
+                        dist.broadcast(tensor=self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]], src=rank, group=self.split_config.batch_group, async_op=False)
 
                     output_buffer_ = []
-                    for rank in range(self.distri_config.n_device_per_batch):
+                    for rank in range(self.split_config.n_device_per_batch):
                         output_buffer_.append(self.output_buffer[slice_indice[rank] : slice_indice[rank + 1]].view(b, c, -1, w))
                     output = torch.cat(output_buffer_, dim=2)
-                # ----------------------------------------------------------------------------------------------------#
             if record:
                 if self.static_inputs is None:
                     self.static_inputs = {

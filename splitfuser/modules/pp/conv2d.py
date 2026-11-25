@@ -3,13 +3,13 @@ from torch import distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from distrifuser.modules.base_module import BaseModule
-from distrifuser.utils import DistriConfig
+from splitfuser.modules.base_module import BaseModule
+from splitfuser.utils import SplitConfig
 
 
-class DistriConv2dPP(BaseModule):
-    def __init__(self, module: nn.Conv2d, distri_config: DistriConfig, is_first_layer: bool = False):
-        super(DistriConv2dPP, self).__init__(module, distri_config)
+class SplitConv2dPP(BaseModule):
+    def __init__(self, module: nn.Conv2d, split_config: SplitConfig, is_first_layer: bool = False):
+        super(SplitConv2dPP, self).__init__(module, split_config)
         self.is_first_layer = is_first_layer
 
     def naive_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -18,25 +18,23 @@ class DistriConv2dPP(BaseModule):
         return output
 
     def sliced_forward(self, x: torch.Tensor) -> torch.Tensor:
-        config = self.distri_config
+        config = self.split_config
         b, c, h, w = x.shape
         assert h % config.n_device_per_batch == 0
 
         stride = self.module.stride[0]
         padding = self.module.padding[0]
 
-        # ----------------------------------------------------------------------------------------------------
-        if self.counter <= self.distri_config.warmup_steps:
+        if self.counter <= self.split_config.warmup_steps:
             output_h = x.shape[2] // stride // config.n_device_per_batch
             idx = config.split_idx()
             h_begin = output_h * idx * stride - padding
             h_end = output_h * (idx + 1) * stride + padding
         else:
-            slice_h = self.distri_config.get_split_list(h)
+            slice_h = self.split_config.get_split_list(h)
             slice_h = [sum(slice_h[:i]) for i in range(len(slice_h) + 1)]
-            h_begin = slice_h[self.distri_config.split_idx()] - padding
-            h_end = slice_h[self.distri_config.split_idx() + 1] + padding
-        # ----------------------------------------------------------------------------------------------------
+            h_begin = slice_h[self.split_config.split_idx()] - padding
+            h_end = slice_h[self.split_config.split_idx() + 1] + padding
 
         final_padding = [padding, padding, 0, 0]
         if h_begin < 0:
@@ -50,14 +48,14 @@ class DistriConv2dPP(BaseModule):
         return F.conv2d(padded_input, self.module.weight, self.module.bias, stride=stride, padding="valid")
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        distri_config = self.distri_config
+        split_config = self.split_config
 
         if self.comm_manager is not None and self.comm_manager.handles is not None and self.idx is not None:
             if self.comm_manager.handles[self.idx] is not None:
                 self.comm_manager.handles[self.idx].wait()
                 self.comm_manager.handles[self.idx] = None
 
-        if distri_config.n_device_per_batch == 1:
+        if split_config.n_device_per_batch == 1:
             output = self.naive_forward(x)
         else:
             if self.is_first_layer:
@@ -79,18 +77,18 @@ class DistriConv2dPP(BaseModule):
                 else:
 
                     def create_padded_x():
-                        if distri_config.split_idx() == 0:
-                            concat_x = torch.cat([x, self.buffer_list[distri_config.split_idx() + 1][0]], dim=2)
+                        if split_config.split_idx() == 0:
+                            concat_x = torch.cat([x, self.buffer_list[split_config.split_idx() + 1][0]], dim=2)
                             padded_x = F.pad(concat_x, [0, 0, boundary_size, 0], mode="constant")
-                        elif distri_config.split_idx() == distri_config.n_device_per_batch - 1:
-                            concat_x = torch.cat([self.buffer_list[distri_config.split_idx() - 1][1], x], dim=2)
+                        elif split_config.split_idx() == split_config.n_device_per_batch - 1:
+                            concat_x = torch.cat([self.buffer_list[split_config.split_idx() - 1][1], x], dim=2)
                             padded_x = F.pad(concat_x, [0, 0, 0, boundary_size], mode="constant")
                         else:
                             padded_x = torch.cat(
                                 [
-                                    self.buffer_list[distri_config.split_idx() - 1][1],
+                                    self.buffer_list[split_config.split_idx() - 1][1],
                                     x,
-                                    self.buffer_list[distri_config.split_idx() + 1][0],
+                                    self.buffer_list[split_config.split_idx() + 1][0],
                                 ],
                                 dim=2,
                             )
@@ -98,8 +96,8 @@ class DistriConv2dPP(BaseModule):
 
                     boundary = torch.stack([x[:, :, :boundary_size, :], x[:, :, -boundary_size:, :]], dim=0)
 
-                    if distri_config.mode == "full_sync" or self.counter <= distri_config.warmup_steps:
-                        dist.all_gather(self.buffer_list, boundary, group=distri_config.batch_group, async_op=False)
+                    if split_config.mode == "full_sync" or self.counter <= split_config.warmup_steps:
+                        dist.all_gather(self.buffer_list, boundary, group=split_config.batch_group, async_op=False)
                         padded_x = create_padded_x()
                         output = F.conv2d(
                             padded_x,
@@ -117,7 +115,7 @@ class DistriConv2dPP(BaseModule):
                             stride=self.module.stride[0],
                             padding=(0, self.module.padding[1]),
                         )
-                        if distri_config.mode != "no_sync":
+                        if split_config.mode != "no_sync":
                             self.comm_manager.enqueue(self.idx, boundary)
 
         self.counter += 1

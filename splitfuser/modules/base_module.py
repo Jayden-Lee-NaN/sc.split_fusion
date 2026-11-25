@@ -1,17 +1,17 @@
 from torch import nn
 
-from distrifuser.utils import DistriConfig
+from splitfuser.utils import SplitConfig
 
 
 class BaseModule(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        distri_config: DistriConfig,
+        split_config: SplitConfig,
     ):
         super(BaseModule, self).__init__()
         self.module = module
-        self.distri_config = distri_config
+        self.split_config = split_config
         self.comm_manager = None
 
         self.counter = 0
